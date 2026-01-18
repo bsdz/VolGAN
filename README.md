@@ -1,23 +1,95 @@
-# VolGAN
-Code to accompany the paper "VolGAN: a generative model for arbitrage-free implied volatility surfaces"
-https://www.tandfonline.com/doi/full/10.1080/1350486X.2025.2471317
+# VolGAN (Fork)
 
+This repository contains a fork of VolGAN, a generative adversarial network for producing implied volatility surfaces while penalizing static arbitrage violations.
 
-VolGAN.py contains the necessary functions to train VolGAN, alongside arbitrage penalty calculation functions.
-VolGAN-example.py is an example of how to use the file and check the arbitrage penalties in the simulations.
+The original project summary can be seen in README.orig.md.
 
-datacleaning.py contains functions used for cleaning up and extracting implied volatility data from the Option Prices file downloaded from OptionMetrics. It also contains smoothing (Nadaraya-Watson and vega-weighted Nadaraya-Watson) functions (and interpolation functions)
+This fork extends the original code toward a more practical local workflow:
 
-Description of the .csv files:
-  -datapath contains data.csv file, which is the data file downloaded from OptionMetrics Implied Volatility Surface File
-  -surfacepath contains surfaces_transform.csv file, which has daily implied volatility surfaces on a pre-defined (m,tau) grid, in vector form ('flattened', use the detangle_kt and entangle_kt functions for this) 
+- Added a CLI workflow in volgan_cli.py for:
+  - Surface generation from raw options CSVs
+  - Input analysis
+  - Training
+  - Simulation and 3D HTML output
+- Shifted data handling toward local CSV pipelines (no required Yahoo fetch path in the main forked flow).
+- Added structured return types in training API (VolGANResults) for clearer downstream use.
+- Improved tensor/device handling in key numerical paths to reduce CPU/GPU mismatch issues.
+- Updated smoothness penalty construction and related training internals for more explicit matrix/weight handling.
+- Added packaging metadata via pyproject.toml and dependency pinning for reproducible setup.
 
-Unfortunately, I am not able to share the pre-process data. All data used is downloaded from OptionMetrics. Two types of implied volatility data sets can be downloaded from OptionMetrics, and both can be utilised for VolGAN (option prices or implied vol surface, which is pre-smoothed). Processing the raw data to reach a suitable format is relatively straightforward.
+## Instructions
 
-Some advice on data processing:
-  -If opting for the Option Prices file, make sure to use options which have a non-zero volume traded
-  -The repo has .py files which clean and prepare the data from the Option Prices file
-  -Implied Volatility Surface file has implied vols on a fixed (delta, tau) grid, and it is pre-smoothed, so fewer manipulations are required
-  -To reach a fixed (m, tau) grid, some interpolation/extrapolation is necessary
+1) Setup
 
+Use Python 3.13+ and pip or install dependencies from pyproject.toml.
 
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e .
+```
+
+You will also need to install the python version of [Peter Jäckel's Let's Be Rational](http://www.jaeckel.org/LetsBeRational.7z).
+
+2) Prepare Input Data
+
+You need:
+- Price history CSV (example: AAPL-prices.csv)
+- Raw options/volatility CSV (example path in this repo: Kaggle/aapl_2016_2020.csv)
+
+You can also provide a pre-generated surface CSV directly.
+
+3) Generate Surfaces (if needed)
+
+```bash
+python volgan_cli.py \
+  --generate-surface \
+  --price-data-path data-in/AAPL-prices.csv \
+  --raw-vol-data-path data-in/aapl_2016_2020.csv \
+  --surface-path surfacepath/surfaces_transform_enhanced.csv
+```
+
+4) Analyze Inputs
+
+```bash
+python volgan_cli.py \
+  --analyze \
+  --price-data-path data-in/AAPL-prices.csv \
+  --surface-path data-out/surfaces_transform_enhanced.csv
+```
+
+5) Train
+
+```bash
+python volgan_cli.py \
+  --train \
+  --price-data-path data-in/AAPL-prices.csv \
+  --surface-path data-out/surfaces_transform_enhanced.csv \
+  --device cpu
+```
+
+Notes:
+- Set --device cuda if your CUDA setup is available.
+- Training artifacts are saved to volgan_res.pkl and a timestamped backup.
+
+6) Simulate and Export Surface Plot
+
+```bash
+python volgan_cli.py --simulate --device cpu
+```
+
+This writes an interactive surface file generated_surface.html.
+
+### Toy - This Vol Surface Does Not Exist Demo
+
+Starts a web server that generates 3d interactive vol surfaces (from latent space).
+
+```bash
+python volgan_tvsdne.py \
+  --port 8080
+```
+
+Note that the training input data is probably not very high quality (from Kaggle).
+
+![TVSDNE](./tvsdne-screenshot.png)

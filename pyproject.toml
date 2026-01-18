@@ -1,0 +1,15 @@
+[project]
+name = "volgan-tvsdne"
+version = "0.1.0"
+description = "Fork of VolGAN for TVSDNE"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiohttp>=3.13.3",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.1",
+    "plotly>=6.5.2",
+    "scipy>=1.17.0",
+    "torch>=2.9.1",
+    "tqdm>=4.67.1",
+]

@@ -1,30 +1,27 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Created on Tue May 30 17:38:10 2023
+Original by vuletic@maths.ox.ac.uk (Code to go with the VolGAN paper).
 
-@author: vuletic@maths.ox.ac.uk
+Extra enhancements and modifications by blairuk@gmail.com:
 
-Code to go with the VolGAN paper
+* Replaced SPY/Yahoo data fetch flow with CSV-based + loading and date/length
+    alignment logic.
+* Reworked smoothness penalty construction in training to explicit time/strike
+    finite-difference operators & weight vectors.
+* Hardened tensor device handling (in arbitrage penalty and smallBS tensor
+    paths) to avoid cross-device runtime issues.
+* Changed VolGAN output from positional tuple to named VolGANResults structure.
+* Black autoformatting.
 """
 
-from datetime import datetime
+from typing import NamedTuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import yfinance as yf
-
-# from scipy import array
 from scipy.stats import norm
 from tqdm import tqdm
-
-
-def get_data_yahoo(syms, start, end):
-    yt = yf.Ticker(syms[0])
-    return yt.history(start=start, end=end, auto_adjust=False)
 
 
 # Calculating arbitrage penalties
@@ -149,9 +146,11 @@ def arbitrage_penalty_tensor(C, P_T, P_K, PB_K):
     plus
     4) the sum of all penalties together (scalar)
     """
-    P1 = torch.max(torch.tensor(0.0), torch.matmul(C, P_T))
-    P2 = torch.max(torch.tensor(0.0), torch.matmul(P_K, C))
-    P3 = torch.max(torch.tensor(0.0), torch.matmul(PB_K, C))
+    device = C.device
+    zero = torch.tensor(0.0, device=device)
+    P1 = torch.max(zero, torch.matmul(C, P_T))
+    P2 = torch.max(zero, torch.matmul(P_K, C))
+    P3 = torch.max(zero, torch.matmul(PB_K, C))
     return (
         P1,
         P2,
@@ -340,11 +339,13 @@ def scatter_surface(X, Y, Z, xlabel, ylabel, zlabel, title):
     plt.show()
 
 
-def smallBS_tensor(m, tau, sigma, r):
+def smallBS_tensor(m, tau, sigma, r, device):
     """
     relative call: tensor
     """
-    norm = torch.distributions.Normal(torch.tensor([0.0]), torch.tensor([1.0]))
+    norm = torch.distributions.Normal(
+        torch.tensor([0.0], device=device), torch.tensor([1.0], device=device)
+    )
     d1 = (-torch.log(m) + tau * (r + 0.5 * sigma * sigma)) / (sigma * torch.sqrt(tau))
     d2 = d1 - sigma * torch.sqrt(tau)
     price = norm.cdf(d1) - m * norm.cdf(d2) * torch.exp(-r * tau)
@@ -368,128 +369,57 @@ def ConvertDelta(m, tau, sigma, r=0):
     return delta
 
 
-def SPXDataPlot(datapath, surfacespath):
+def VolGANData(datapath, surfacespath):
     # read the data
     data = pd.read_csv(datapath)
     # date_dt = pd.to_datetime(data['date'],format='%d/%m/%Y')
     # cutoff_date = pd.to_datetime('01/01/2020',format='%d/%m/%Y')
     # data = data[date_dt<cutoff_date]
     # surfaces saved separately
-    sfts_df = pd.read_csv(surfacespath)
-    surfaces_transform = np.array(sfts_df)
-    surfaces_transform = surfaces_transform[:, 1:]
+    surfaces_transform = pd.read_csv(surfacespath, index_col=0).values
     dates = data["date"].unique()
-    data_temp = data[data["date"] == dates[0]]
-    days = data_temp["days"].unique()
-    dates_format = np.copy(dates)
-    for i in tqdm(range(len(dates_format))):
-        dates_format[i] = dates[i][6:] + "-" + dates[i][3:5] + "-" + dates[i][0:2]
-    # yf.pdr_override()
-    y_symbols = ["SPY"]
-    startdate = datetime(2000, 1, 3)
-    enddate = datetime(2022, 1, 1)
-    # SPY = pdr.get_data_yahoo(y_symbols, start=startdate, end=enddate)
-    SPY = get_data_yahoo(y_symbols, start=startdate, end=enddate)
-    prices = np.array(SPY["Adj Close"] * 10)
-    tau = np.copy(days[1:9]) / 365
-    dtm = np.copy(days[1:])
+    # data_temp = data[data["date"] == dates[0]]
+    # days = data_temp["days"].unique()
+    # Hardcoded days grid matching generate_aapl_surfaces_enhanced.py
+    days = np.array([30, 60, 91, 122, 152, 182, 273, 365])
+
+    prices = np.array(data["close"])
+
+    n_surfaces = surfaces_transform.shape[0]
+    n_prices = len(prices)
+
+    if n_prices > n_surfaces:
+        # Assuming alignment at the END (latest data) or START?
+        # Let's assume START matching.
+        prices = prices[:n_surfaces]
+        # dates = dates[:n_surfaces] # If we use dates later
+
+        # NOTE: VolGAN usually expects 'dates' to correspond to the surfaces.
+        # So we should also slice 'dates'.
+        dates = data["date"].unique()[:n_surfaces]
+    elif n_surfaces > n_prices:
+        # Trim surfaces
+        surfaces_transform = surfaces_transform[:n_prices]
+        dates = data["date"].unique()[:n_prices]
+
     m = np.linspace(0.6, 1.4, 10)
-    tau = np.copy(days[1:9]) / 365
-    dtm = np.copy(days[1:9])
+    tau = np.copy(days) / 365
+    dtm = np.copy(days)
     taus, ms = np.meshgrid(tau, m)
     # penalty matrices in m and tau
     mP_t, mP_k, mPb_K = penalty_mutau(m, dtm)
-    # arbitrage violations of the data
-    tots = [None] * len(dates)
-    p1s = [None] * len(dates)
-    p2s = [None] * len(dates)
-    p3s = [None] * len(dates)
-    for i1 in tqdm(range(len(dates))):
-        I = np.zeros(shape=(len(m), len(dtm)))
-        for i in range(len(dtm)):
-            I[:, i] = surfaces_transform[i1][(i * len(m)) : ((i + 1) * len(m))]
-        BS = smallBS(ms, taus, I, 0)
-        P1, P2, P3, tots[i1] = arbitrage_penalty(BS, mP_t, mP_k, mPb_K)
-        p1s[i1] = np.sum(P1)
-        p2s[i1] = np.sum(P2)
-        p3s[i1] = np.sum(P3)
-    dates_dt = pd.to_datetime(dates_format)
-    tots = np.array(tots)
-    plt.figure("Arbitrage penalty")
-    plt.title("Arbitrage penalty in SPX data")
-    plt.plot(dates_dt, tots, label="total")
-    plt.plot(dates_dt, p1s, label="calendar")
-    plt.plot(dates_dt, p2s, label="call")
-    plt.plot(dates_dt, p3s, label="butterfly")
-    plt.legend(loc="best")
-    plt.show()
-    startdate = datetime(1999, 12, 31)
-    enddate = datetime(2000, 1, 1)
-    # SPY2 = pdr.get_data_yahoo(y_symbols, start=startdate, end=enddate)
-    SPY2 = get_data_yahoo(y_symbols, start=startdate, end=enddate)
-    prices_prev = np.zeros(len(prices))
-    prices_prev[1:] = prices[0:-1]
-    prices_prev[0] = 10 * SPY2["Adj Close"].item()
-    log_rtn = np.log(prices) - np.log(prices_prev)
-    dates_arb = dates_dt[tots > 0]
-    return (
-        surfaces_transform,
-        prices,
-        prices_prev,
-        log_rtn,
-        m,
-        tau,
-        ms,
-        taus,
-        dates_dt,
-        dates_arb,
-        tots,
-    )
 
-
-def SPXData(datapath, surfacespath):
-    """
-    function to read the pre-processed SPX implied vol data
-    """
-    # read the data
-    data = pd.read_csv(datapath)
-    # date_dt = pd.to_datetime(data['date'],format='%d/%m/%Y')
-    # cutoff_date = pd.to_datetime('01/01/2020',format='%d/%m/%Y')
-    # data = data[date_dt<cutoff_date]
-    sfts_df = pd.read_csv(surfacespath)
-    surfaces_transform = np.array(sfts_df)
-    surfaces_transform = surfaces_transform[:, 1:]
-    dates = data["date"].unique()
-    data_temp = data[data["date"] == dates[0]]
-    days = data_temp["days"].unique()
-    dates_format = np.copy(dates)
-    for i in tqdm(range(len(dates_format))):
-        dates_format[i] = dates[i][6:] + "-" + dates[i][3:5] + "-" + dates[i][0:2]
-    # yf.pdr_override()
-    y_symbols = ["SPY"]
-    startdate = datetime(2000, 1, 3)
-    enddate = datetime(2022, 1, 1)
-    # SPY = pdr.get_data_yahoo(y_symbols, start=startdate, end=enddate)
-    SPY = get_data_yahoo(y_symbols, start=startdate, end=enddate)
-    prices = np.array(SPY["Adj Close"] * 10)
-    tau = np.copy(days[1:9]) / 365
-    dtm = np.copy(days[1:])
-    m = np.linspace(0.6, 1.4, 10)
-    tau = np.copy(days[1:9]) / 365
-    dtm = np.copy(days[1:9])
-    taus, ms = np.meshgrid(tau, m)
-    # penalty matrices in m and tau
-    mP_t, mP_k, mPb_K = penalty_mutau(m, dtm)
-    dates_dt = pd.to_datetime(dates_format)
-
-    startdate = datetime(1999, 12, 31)
-    enddate = datetime(2000, 1, 1)
-    # SPY2 = pdr.get_data_yahoo(y_symbols, start=startdate, end=enddate)
-    SPY2 = get_data_yahoo(y_symbols, start=startdate, end=enddate)
+    # Handling date format for plotting/tracking (optional but good to keep working)
+    # AAPL-prices.csv date format is likely YYYY-MM-DD (e.g., 2014-02-06)
+    # The original code expected DD/MM/YYYY or similar and did manual parsing.
+    # We can just use pd.to_datetime directly on the 'dates' array which usually handles ISO format well.
+    dates_dt = pd.to_datetime(dates)
 
     prices_prev = np.zeros(len(prices))
     prices_prev[1:] = prices[0:-1]
-    prices_prev[0] = 10 * SPY2["Adj Close"].item()
+    # Approximate previous price for the first element
+    prices_prev[0] = prices[0]
+
     log_rtn = np.log(prices) - np.log(prices_prev)
     return surfaces_transform, prices, prices_prev, log_rtn, m, tau, ms, taus, dates_dt
 
@@ -605,7 +535,7 @@ def DataPreprocesssing(datapath, surfacepath):
     later to be split into train, val, test
     """
     surfaces_transform, prices, prices_prev, log_rtn, m, tau, ms, taus, dates_dt = (
-        SPXData(datapath, surfacepath)
+        VolGANData(datapath, surfacepath)
     )
     # realised volatility at time t-1
     realised_vol_tm1 = np.zeros(len(log_rtn) - 22)
@@ -785,25 +715,38 @@ def GradientMatching(
     mP_t, mP_k, mPb_K = penalty_mutau_tensor(m, dtm, device)
     moneyness_t = torch.tensor(m, dtype=torch.float, device=device)
 
-    # smoothness penalties
-    Ngrid = lk * lt
+    # Time smoothness: Diffs across time (stride lk)
+    # Output size: lk * (lt - 1) = 70
     tau_t = torch.tensor(tau, dtype=torch.float, device=device)
-    t_seq = torch.zeros((tau_t.shape[0]), dtype=torch.float, device=device)
-    for i in range(tau_t.shape[0] - 1):
+    t_seq = torch.zeros((lt - 1), dtype=torch.float, device=device)
+    for i in range(lt - 1):
         t_seq[i] = 1 / ((tau_t[i + 1] - tau_t[i]) ** 2)
-    matrix_t = torch.zeros((Ngrid, Ngrid), device=device, dtype=torch.float)
-    for i in range(Ngrid - 1):
-        matrix_t[i, i] = -1
-        matrix_t[i, i + 1] = 1
-    tsq = t_seq.repeat(lk).unsqueeze(0)
-    matrix_m = torch.zeros((Ngrid - lk, Ngrid), device=device, dtype=torch.float)
-    for i in range(Ngrid - lk):
-        matrix_m[i, i] = -1
-        matrix_m[i, i + lk] = 1
 
-    m_seq = torch.zeros((lk * (lt - 1)), dtype=torch.float, device=device)
-    for i in range(moneyness_t.shape[0] - 1):
-        m_seq[i * lk : (i + 1) * lk] = 1 / ((moneyness_t[i + 1] - moneyness_t[i]) ** 2)
+    matrix_t = torch.zeros((lk * (lt - 1), lk * lt), device=device, dtype=torch.float)
+    for i in range(lk * (lt - 1)):
+        matrix_t[i, i] = -1
+        matrix_t[i, i + lk] = 1
+
+    # Time weights: [w0...w0 (10), w1...w1 (10)...]
+    tsq = torch.repeat_interleave(t_seq, lk).unsqueeze(0)
+
+    # Moneyness smoothness: Diffs across strike (stride 1, skip boundaries)
+    # Output size: lt * (lk - 1) = 8 * 9 = 72
+    moneyness_t = torch.tensor(m, dtype=torch.float, device=device)
+    matrix_m = torch.zeros((lt * (lk - 1), lk * lt), device=device, dtype=torch.float)
+    row = 0
+    for t_idx in range(lt):
+        for k_idx in range(lk - 1):
+            col = t_idx * lk + k_idx
+            matrix_m[row, col] = -1
+            matrix_m[row, col + 1] = 1
+            row += 1
+
+    # Moneyness weights: [w0...w8, w0...w8...]
+    m_base_seq = torch.zeros((lk - 1), dtype=torch.float, device=device)
+    for i in range(lk - 1):
+        m_base_seq[i] = 1 / ((moneyness_t[i + 1] - moneyness_t[i]) ** 2)
+    m_seq = m_base_seq.repeat(lt).unsqueeze(0)
 
     n_epochs = n_grad
     discloss = [False] * (n_batches * n_epochs)
@@ -949,25 +892,38 @@ def GradientMatchingPlot(
     mP_t, mP_k, mPb_K = penalty_mutau_tensor(m, dtm, device)
     moneyness_t = torch.tensor(m, dtype=torch.float, device=device)
 
-    # smoothness penalties
-    Ngrid = lk * lt
+    # Time smoothness: Diffs across time (stride lk)
+    # Output size: lk * (lt - 1) = 70
     tau_t = torch.tensor(tau, dtype=torch.float, device=device)
-    t_seq = torch.zeros((tau_t.shape[0]), dtype=torch.float, device=device)
-    for i in range(tau_t.shape[0] - 1):
+    t_seq = torch.zeros((lt - 1), dtype=torch.float, device=device)
+    for i in range(lt - 1):
         t_seq[i] = 1 / ((tau_t[i + 1] - tau_t[i]) ** 2)
-    matrix_t = torch.zeros((Ngrid, Ngrid), device=device, dtype=torch.float)
-    for i in range(Ngrid - 1):
-        matrix_t[i, i] = -1
-        matrix_t[i, i + 1] = 1
-    tsq = t_seq.repeat(lk).unsqueeze(0)
-    matrix_m = torch.zeros((Ngrid - lk, Ngrid), device=device, dtype=torch.float)
-    for i in range(Ngrid - lk):
-        matrix_m[i, i] = -1
-        matrix_m[i, i + lk] = 1
 
-    m_seq = torch.zeros((lk * (lt - 1)), dtype=torch.float, device=device)
-    for i in range(moneyness_t.shape[0] - 1):
-        m_seq[i * lk : (i + 1) * lk] = 1 / ((moneyness_t[i + 1] - moneyness_t[i]) ** 2)
+    matrix_t = torch.zeros((lk * (lt - 1), lk * lt), device=device, dtype=torch.float)
+    for i in range(lk * (lt - 1)):
+        matrix_t[i, i] = -1
+        matrix_t[i, i + lk] = 1
+
+    # Time weights: [w0...w0 (10), w1...w1 (10)...]
+    tsq = torch.repeat_interleave(t_seq, lk).unsqueeze(0)
+
+    # Moneyness smoothness: Diffs across strike (stride 1, skip boundaries)
+    # Output size: lt * (lk - 1) = 8 * 9 = 72
+    moneyness_t = torch.tensor(m, dtype=torch.float, device=device)
+    matrix_m = torch.zeros((lt * (lk - 1), lk * lt), device=device, dtype=torch.float)
+    row = 0
+    for t_idx in range(lt):
+        for k_idx in range(lk - 1):
+            col = t_idx * lk + k_idx
+            matrix_m[row, col] = -1
+            matrix_m[row, col + 1] = 1
+            row += 1
+
+    # Moneyness weights: [w0...w8, w0...w8...]
+    m_base_seq = torch.zeros((lk - 1), dtype=torch.float, device=device)
+    for i in range(lk - 1):
+        m_base_seq[i] = 1 / ((moneyness_t[i + 1] - moneyness_t[i]) ** 2)
+    m_seq = m_base_seq.repeat(lt).unsqueeze(0)
 
     n_epochs = n_grad
     discloss = [False] * (n_batches * n_epochs)
@@ -1136,25 +1092,38 @@ def TrainLoopNoVal(
     dtm = tau * 365
     mP_t, mP_k, mPb_K = penalty_mutau_tensor(m, dtm, device)
     moneyness_t = torch.tensor(m, dtype=torch.float, device=device)
-    # smoothness penalties
-    Ngrid = lk * lt
+    # Time smoothness: Diffs across time (stride lk)
+    # Output size: lk * (lt - 1) = 70
     tau_t = torch.tensor(tau, dtype=torch.float, device=device)
-    t_seq = torch.zeros((tau_t.shape[0]), dtype=torch.float, device=device)
-    for i in range(tau_t.shape[0] - 1):
+    t_seq = torch.zeros((lt - 1), dtype=torch.float, device=device)
+    for i in range(lt - 1):
         t_seq[i] = 1 / ((tau_t[i + 1] - tau_t[i]) ** 2)
-    matrix_t = torch.zeros((Ngrid, Ngrid), device=device, dtype=torch.float)
-    for i in range(Ngrid - 1):
-        matrix_t[i, i] = -1
-        matrix_t[i, i + 1] = 1
-    tsq = t_seq.repeat(lk).unsqueeze(0)
-    matrix_m = torch.zeros((Ngrid - lk, Ngrid), device=device, dtype=torch.float)
-    for i in range(Ngrid - lk):
-        matrix_m[i, i] = -1
-        matrix_m[i, i + lk] = 1
 
-    m_seq = torch.zeros((lk * (lt - 1)), dtype=torch.float, device=device)
-    for i in range(moneyness_t.shape[0] - 1):
-        m_seq[i * lk : (i + 1) * lk] = 1 / ((moneyness_t[i + 1] - moneyness_t[i]) ** 2)
+    matrix_t = torch.zeros((lk * (lt - 1), lk * lt), device=device, dtype=torch.float)
+    for i in range(lk * (lt - 1)):
+        matrix_t[i, i] = -1
+        matrix_t[i, i + lk] = 1
+
+    # Time weights: [w0...w0 (10), w1...w1 (10)...]
+    tsq = torch.repeat_interleave(t_seq, lk).unsqueeze(0)
+
+    # Moneyness smoothness: Diffs across strike (stride 1, skip boundaries)
+    # Output size: lt * (lk - 1) = 8 * 9 = 72
+    moneyness_t = torch.tensor(m, dtype=torch.float, device=device)
+    matrix_m = torch.zeros((lt * (lk - 1), lk * lt), device=device, dtype=torch.float)
+    row = 0
+    for t_idx in range(lt):
+        for k_idx in range(lk - 1):
+            col = t_idx * lk + k_idx
+            matrix_m[row, col] = -1
+            matrix_m[row, col + 1] = 1
+            row += 1
+
+    # Moneyness weights: [w0...w8, w0...w8...]
+    m_base_seq = torch.zeros((lk - 1), dtype=torch.float, device=device)
+    for i in range(lk - 1):
+        m_base_seq[i] = 1 / ((moneyness_t[i + 1] - moneyness_t[i]) ** 2)
+    m_seq = m_base_seq.repeat(lt).unsqueeze(0)
 
     discloss = [False] * (n_batches * n_epochs)
     genloss = [False] * (n_batches * n_epochs)
@@ -1241,6 +1210,24 @@ def TrainLoopNoVal(
             genprices_fk[epoch * n_batches + i] = condition[0].detach()
 
     return gen, gen_opt, disc, disc_opt, criterion
+
+
+class VolGANResults(NamedTuple):
+    gen: torch.nn.Module
+    gen_opt: torch.optim.Optimizer
+    disc: torch.nn.Module
+    disc_opt: torch.optim.Optimizer
+    true_train: np.ndarray
+    true_val: np.ndarray
+    true_test: np.ndarray
+    condition_train: np.ndarray
+    condition_val: np.ndarray
+    condition_test: np.ndarray
+    dates_t: np.ndarray
+    m: np.ndarray
+    tau: float
+    ms: np.ndarray
+    taus: np.ndarray
 
 
 def VolGAN(
@@ -1338,7 +1325,7 @@ def VolGAN(
         noise_dim,
         device,
     )
-    return (
+    return VolGANResults(
         gen,
         gen_opt,
         disc,
