@@ -13,6 +13,8 @@ Extra enhancements and modifications by blairuk@gmail.com:
 * Black autoformatting.
 """
 
+import io
+import pickle
 from typing import NamedTuple
 
 import matplotlib.pyplot as plt
@@ -22,6 +24,16 @@ import torch
 import torch.nn as nn
 from scipy.stats import norm
 from tqdm import tqdm
+
+# Surface grid shared by surface generation, training, simulation and the demo.
+# Surfaces are flattened time-major: index = t_idx * LK + k_idx (see entangle_kt).
+LK = 10
+LT = 8
+M_GRID = np.linspace(0.6, 1.4, LK)
+TAU_DAYS = np.array([30, 60, 91, 122, 152, 182, 273, 365])
+TAU_GRID = TAU_DAYS / 365.0
+
+DEFAULT_NOISE_DIM = 32
 
 
 # Calculating arbitrage penalties
@@ -298,7 +310,7 @@ def combine_vectors(x, y, dim=-1):
     """
     combined = torch.cat([x, y], dim=dim)
     combined = combined.to(torch.float)
-    return
+    return combined
 
 
 def entangle_kt(surface, lk, lt):
@@ -370,55 +382,49 @@ def ConvertDelta(m, tau, sigma, r=0):
 
 
 def VolGANData(datapath, surfacespath):
-    # read the data
-    data = pd.read_csv(datapath)
-    # date_dt = pd.to_datetime(data['date'],format='%d/%m/%Y')
-    # cutoff_date = pd.to_datetime('01/01/2020',format='%d/%m/%Y')
-    # data = data[date_dt<cutoff_date]
-    # surfaces saved separately
-    surfaces_transform = pd.read_csv(surfacespath, index_col=0).values
-    dates = data["date"].unique()
-    # data_temp = data[data["date"] == dates[0]]
-    # days = data_temp["days"].unique()
-    # Hardcoded days grid matching generate_aapl_surfaces_enhanced.py
-    days = np.array([30, 60, 91, 122, 152, 182, 273, 365])
+    """
+    Load the price history and the daily surfaces and align them by date.
 
-    prices = np.array(data["close"])
+    The price CSV needs "date" (YYYY-MM-DD) and "close" columns. The surface CSV
+    is indexed by date with LK * LT flattened implied vols per row.
 
-    n_surfaces = surfaces_transform.shape[0]
-    n_prices = len(prices)
+    Previous-close prices are taken from the full price history before the
+    join, so the log-return on each surface date is the true one-day return
+    even when the price file starts earlier than the surfaces. Surface dates
+    without a price (e.g. bogus quotes on market holidays) are dropped.
+    """
+    prices_df = pd.read_csv(datapath, usecols=["date", "close"])
+    prices_df["date"] = pd.to_datetime(prices_df["date"])
+    prices_df = (
+        prices_df.drop_duplicates("date").sort_values("date").set_index("date")
+    )
+    prices_df["close_prev"] = prices_df["close"].shift(1)
 
-    if n_prices > n_surfaces:
-        # Assuming alignment at the END (latest data) or START?
-        # Let's assume START matching.
-        prices = prices[:n_surfaces]
-        # dates = dates[:n_surfaces] # If we use dates later
+    surfaces_df = pd.read_csv(surfacespath, index_col=0)
+    surfaces_df.index = pd.to_datetime(surfaces_df.index)
+    surfaces_df = surfaces_df.sort_index()
+    if surfaces_df.shape[1] != LK * LT:
+        raise ValueError(
+            f"Expected {LK * LT} surface columns, found {surfaces_df.shape[1]}"
+        )
 
-        # NOTE: VolGAN usually expects 'dates' to correspond to the surfaces.
-        # So we should also slice 'dates'.
-        dates = data["date"].unique()[:n_surfaces]
-    elif n_surfaces > n_prices:
-        # Trim surfaces
-        surfaces_transform = surfaces_transform[:n_prices]
-        dates = data["date"].unique()[:n_prices]
+    joined = surfaces_df.join(prices_df, how="inner").dropna(
+        subset=["close", "close_prev"]
+    )
+    n_dropped = len(surfaces_df) - len(joined)
+    if n_dropped:
+        print(f"VolGANData: dropped {n_dropped} surface dates with no matching price")
+    if len(joined) == 0:
+        raise ValueError("No overlapping dates between prices and surfaces")
 
-    m = np.linspace(0.6, 1.4, 10)
-    tau = np.copy(days) / 365
-    dtm = np.copy(days)
+    surfaces_transform = joined[surfaces_df.columns].to_numpy()
+    prices = joined["close"].to_numpy()
+    prices_prev = joined["close_prev"].to_numpy()
+    dates_dt = joined.index
+
+    m = M_GRID.copy()
+    tau = TAU_GRID.copy()
     taus, ms = np.meshgrid(tau, m)
-    # penalty matrices in m and tau
-    mP_t, mP_k, mPb_K = penalty_mutau(m, dtm)
-
-    # Handling date format for plotting/tracking (optional but good to keep working)
-    # AAPL-prices.csv date format is likely YYYY-MM-DD (e.g., 2014-02-06)
-    # The original code expected DD/MM/YYYY or similar and did manual parsing.
-    # We can just use pd.to_datetime directly on the 'dates' array which usually handles ISO format well.
-    dates_dt = pd.to_datetime(dates)
-
-    prices_prev = np.zeros(len(prices))
-    prices_prev[1:] = prices[0:-1]
-    # Approximate previous price for the first element
-    prices_prev[0] = prices[0]
 
     log_rtn = np.log(prices) - np.log(prices_prev)
     return surfaces_transform, prices, prices_prev, log_rtn, m, tau, ms, taus, dates_dt
@@ -537,11 +543,12 @@ def DataPreprocesssing(datapath, surfacepath):
     surfaces_transform, prices, prices_prev, log_rtn, m, tau, ms, taus, dates_dt = (
         VolGANData(datapath, surfacepath)
     )
-    # realised volatility at time t-1
+    # realised volatility at time t-1 (paper eq. 8): the 21 returns up to and
+    # including t-1. Sample i predicts index i + 22, so t-1 is index i + 21.
     realised_vol_tm1 = np.zeros(len(log_rtn) - 22)
     for i in range(len(realised_vol_tm1)):
         realised_vol_tm1[i] = np.sqrt(252 / 21) * np.sqrt(
-            np.sum(log_rtn[i : (i + 21)] ** 2)
+            np.sum(log_rtn[i + 1 : (i + 22)] ** 2)
         )
     # shift the time
     dates_t = dates_dt[22:]
@@ -710,7 +717,7 @@ def GradientMatching(
     perform gradient matching
     """
     n_train = condition_train.shape[0]
-    n_batches = n_train // batch_size + 1
+    n_batches = (n_train + batch_size - 1) // batch_size  # ceil; no empty batch
     dtm = tau * 365
     mP_t, mP_k, mPb_K = penalty_mutau_tensor(m, dtm, device)
     moneyness_t = torch.tensor(m, dtype=torch.float, device=device)
@@ -753,8 +760,6 @@ def GradientMatching(
     genloss = [False] * (n_batches * n_epochs)
     dscpred_real = [False] * (n_batches * n_epochs)
     dscpred_fake = [False] * (n_batches * n_epochs)
-    gen_fake = [False] * (n_batches * n_epochs)
-    genprices_fk = [False] * (n_batches * n_epochs)
     BCE_grad = []
     m_smooth_grad = []
     t_smooth_grad = []
@@ -808,7 +813,9 @@ def GradientMatching(
 
             disc_fake_pred = disc(fake_and_cond)
 
-            fake_surface = torch.exp(fake[:, 1:] + surface_past)
+            # log-implied vol, as in TrainLoopNoVal and the paper (eqs. 11-13), so the
+            # calibrated weights match the scale they are applied at in training
+            fake_surface = fake[:, 1:] + surface_past
 
             penalties_m = [None] * curr_batch_size
             penalties_t = [None] * curr_batch_size
@@ -853,8 +860,6 @@ def GradientMatching(
             BCE_grad.append(total_norm)
             gen_opt.step()
             genloss[epoch * n_batches + i] = gen_loss.detach().item()
-            gen_fake[epoch * n_batches + i] = fake[0].detach()
-            genprices_fk[epoch * n_batches + i] = condition[0].detach()
 
     alpha = np.mean(np.array(BCE_grad) / np.array(m_smooth_grad))
     beta = np.mean(np.array(BCE_grad) / np.array(t_smooth_grad))
@@ -887,7 +892,7 @@ def GradientMatchingPlot(
     perform gradient matching and plot
     """
     n_train = condition_train.shape[0]
-    n_batches = n_train // batch_size + 1
+    n_batches = (n_train + batch_size - 1) // batch_size  # ceil; no empty batch
     dtm = tau * 365
     mP_t, mP_k, mPb_K = penalty_mutau_tensor(m, dtm, device)
     moneyness_t = torch.tensor(m, dtype=torch.float, device=device)
@@ -930,8 +935,6 @@ def GradientMatchingPlot(
     genloss = [False] * (n_batches * n_epochs)
     dscpred_real = [False] * (n_batches * n_epochs)
     dscpred_fake = [False] * (n_batches * n_epochs)
-    gen_fake = [False] * (n_batches * n_epochs)
-    genprices_fk = [False] * (n_batches * n_epochs)
     BCE_grad = []
     m_smooth_grad = []
     t_smooth_grad = []
@@ -985,7 +988,9 @@ def GradientMatchingPlot(
 
             disc_fake_pred = disc(fake_and_cond)
 
-            fake_surface = torch.exp(fake[:, 1:] + surface_past)
+            # log-implied vol, as in TrainLoopNoVal and the paper (eqs. 11-13), so the
+            # calibrated weights match the scale they are applied at in training
+            fake_surface = fake[:, 1:] + surface_past
 
             penalties_m = [None] * curr_batch_size
             penalties_t = [None] * curr_batch_size
@@ -1030,8 +1035,6 @@ def GradientMatchingPlot(
             BCE_grad.append(total_norm)
             gen_opt.step()
             genloss[epoch * n_batches + i] = gen_loss.detach().item()
-            gen_fake[epoch * n_batches + i] = fake[0].detach()
-            genprices_fk[epoch * n_batches + i] = condition[0].detach()
 
     alpha = np.mean(np.array(BCE_grad) / np.array(m_smooth_grad))
     beta = np.mean(np.array(BCE_grad) / np.array(t_smooth_grad))
@@ -1088,7 +1091,7 @@ def TrainLoopNoVal(
     train loop for VolGAN
     """
     n_train = condition_train.shape[0]
-    n_batches = n_train // batch_size + 1
+    n_batches = (n_train + batch_size - 1) // batch_size  # ceil; no empty batch
     dtm = tau * 365
     mP_t, mP_k, mPb_K = penalty_mutau_tensor(m, dtm, device)
     moneyness_t = torch.tensor(m, dtype=torch.float, device=device)
@@ -1129,8 +1132,6 @@ def TrainLoopNoVal(
     genloss = [False] * (n_batches * n_epochs)
     dscpred_real = [False] * (n_batches * n_epochs)
     dscpred_fake = [False] * (n_batches * n_epochs)
-    gen_fake = [False] * (n_batches * n_epochs)
-    genprices_fk = [False] * (n_batches * n_epochs)
 
     gen.train()
     for epoch in tqdm(range(n_epochs)):
@@ -1206,8 +1207,6 @@ def TrainLoopNoVal(
             gen_loss.backward()
             gen_opt.step()
             genloss[epoch * n_batches + i] = gen_loss.detach().item()
-            gen_fake[epoch * n_batches + i] = fake[0].detach()
-            genprices_fk[epoch * n_batches + i] = condition[0].detach()
 
     return gen, gen_opt, disc, disc_opt, criterion
 
@@ -1225,9 +1224,31 @@ class VolGANResults(NamedTuple):
     condition_test: np.ndarray
     dates_t: np.ndarray
     m: np.ndarray
-    tau: float
+    tau: np.ndarray
     ms: np.ndarray
     taus: np.ndarray
+    # Defaulted so pickles saved before this field existed still load.
+    noise_dim: int = DEFAULT_NOISE_DIM
+
+
+def load_results(path, map_location="cpu") -> "VolGANResults":
+    """
+    Load a pickled VolGANResults, remapping any saved tensors to map_location.
+
+    Plain pickle.load restores tensors to the device they were saved from, so a
+    model trained on CUDA cannot otherwise be opened on a CPU-only machine.
+    """
+
+    class _Unpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module == "torch.storage" and name == "_load_from_bytes":
+                return lambda b: torch.load(
+                    io.BytesIO(b), map_location=map_location, weights_only=False
+                )
+            return super().find_class(module, name)
+
+    with open(path, "rb") as fh:
+        return _Unpickler(fh).load()
 
 
 def VolGAN(
@@ -1341,6 +1362,7 @@ def VolGAN(
         tau,
         ms,
         taus,
+        noise_dim,
     )
 
 
@@ -1349,8 +1371,8 @@ def reweighting_stats(penalties, beta):
     post re-weighting stats
     penalties: arbitrage penalties #days x #samples
     """
-    data_m = penalties
-    transform = np.exp(-beta * penalties)
+    data_m = np.array(penalties, dtype=float)  # copy: rows are sorted below
+    transform = np.exp(-beta * data_m)
     for i in range(transform.shape[0]):
         transform[i, :] = transform[i, :] / np.sum(transform[i, :])
     mean_before = np.mean(data_m, axis=1)
@@ -1361,7 +1383,7 @@ def reweighting_stats(penalties, beta):
         mean_after[i] = np.sum(transform[i, :] * data_m[i, :])
         args = np.argsort(data_m[i])
         data_m[i, :] = data_m[i, args]
-        transform[i, :] = transform[i, :]
+        transform[i, :] = transform[i, args]  # keep weights aligned with values
         med = data_m[i, 0]
         sm = 0
         j = 0
@@ -1419,7 +1441,7 @@ def reweighting_stats_mean(penalties, beta):
     post re-weighting stats (mean)
     penalties: arbitrage penalties #days x #samples
     """
-    data_m = penalties
+    data_m = np.array(penalties, dtype=float)  # copy: rows are sorted below
     transform = np.exp(-beta * data_m)
     for i in range(transform.shape[0]):
         transform[i, :] = transform[i, :] / np.sum(transform[i, :])
@@ -1432,7 +1454,7 @@ def reweighting_stats_mean(penalties, beta):
         mean_after[i] = np.sum(transform[i, :] * data_m[i, :])
         args = np.argsort(data_m[i])
         data_m[i, :] = data_m[i, args]
-        transform[i, :] = transform[i, :]
+        transform[i, :] = transform[i, args]  # keep weights aligned with values
         med = data_m[i, 0]
         sm = 0
         j = 0
@@ -1474,21 +1496,17 @@ def VolGAN_mean_surface_day(variable, weights):
 
 def VolGAN_quantile_surface_day(variable, weights, quantile):
     """
-    VolGAN quantile for a fixed day
+    Weighted VolGAN quantile surface for a fixed day, taken at each grid point.
+
+    variable: (n_samples, n_points) surfaces; weights: (n_samples,) summing to 1.
     """
-    args = np.argsort(weights)
-    weights = weights[args]
-    variable = variable[args, :]
-    tot = 0
-    i = 0
-    while tot < quantile:
-        tot = tot + weights[i]
-        i = i + 1
-    if i == len(weights):
-        qnt = variable[-1, :]
-    else:
-        qnt = variable[i, :]
-    return qnt
+    variable = np.asarray(variable)
+    return np.array(
+        [
+            VolGAN_quantile_ret_day(variable[:, j], weights, quantile)
+            for j in range(variable.shape[1])
+        ]
+    )
 
 
 def VolGAN_mean_ret_day(variable, weights):
@@ -1533,7 +1551,7 @@ def extrap1d(interpolator):
             return interpolator(x)
 
     def ufunclike(xs):
-        return np.array(list(map(pointwise, array(xs))))
+        return np.array(list(map(pointwise, np.asarray(xs))))
 
     return ufunclike
 
@@ -1582,16 +1600,16 @@ def VIX(St, IV, m, tau):
     m1 = np.linspace(m_min, m_max, 2 * n_s)
     strikes = m1 * St
     i0 = np.argmin(np.abs(strikes - St))
-    sigma1 = get_points3(IV, m, tau, m1, [1 / 12])[0][0]
+    sigma1 = get_points3(IV, m, tau, m1, [1 / 12])[:, 0]  # vol at each strike
     r = 0
     Call = BS_OptionPrice(St, 1 / 12, r, strikes, sigma1)
     Put = Call - St + strikes
     DeltaK = np.zeros(len(strikes))
     DeltaK[1:] = np.diff(strikes)
     DeltaK[0] = DeltaK[1]
-    VIX = 0
-    for i in range(i0 + 1):
-        VIX = VIX + Put[i] * DeltaK[i] / (strikes[i] ** 2)
+    # out-of-the-money options: puts at and below K0, calls above it
+    otm = np.where(np.arange(len(strikes)) <= i0, Put, Call)
+    VIX = np.sum(otm * DeltaK / strikes**2)
     VIX = 100 * np.sqrt(2 / (1 / 12) * VIX - 1 / (1 / 12) * (St / strikes[i0] - 1) ** 2)
     return VIX
 

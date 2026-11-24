@@ -8,8 +8,15 @@ dependencies = [
     "aiohttp>=3.13.3",
     "matplotlib>=3.10.8",
     "numpy>=2.4.1",
+    "pandas>=2.2",
     "plotly>=6.5.2",
+    # Pure-Python port of Peter Jäckel's Let's Be Rational (MIT), used by --generate-surface.
+    "pylbr @ git+https://github.com/bsdz/py_lets_be_rational.git@6ac830f1d4ae80e17c8025c7eb30d5f73e280121",
     "scipy>=1.17.0",
     "torch>=2.9.1",
     "tqdm>=4.67.1",
 ]
+
+[project.optional-dependencies]
+# hedging_backtest.py
+hedging = ["yabte>=0.5.2"]

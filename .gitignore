@@ -15,3 +15,12 @@ build/
 .mypy_cache/
 .vscode/
 *.nogit/
+
+# local data and run outputs
+data-in/*.csv
+data-out/*.bak
+data-out/volgan_res_*.pkl
+generated_surface.html
+.venv/
+AGENTS.local.md
+data-out/seeds/

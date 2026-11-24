@@ -12,17 +12,23 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import torch
-from letsberational import ImpliedBlackVolatility
 from tqdm import tqdm
 
 from datacleaning import Smooth
 from VolGAN import (
+    DEFAULT_NOISE_DIM,
+    LK,
+    LT,
+    M_GRID,
+    TAU_DAYS,
+    TAU_GRID,
     VolGAN,
     VolGANData,
     VolGANResults,
     arbitrage_penalty_tensor,
     detangle_kt,
     entangle_kt,
+    load_results,
     penalty_mutau_tensor,
     smallBS_tensor,
 )
@@ -31,18 +37,27 @@ root_dir = Path(__file__).parent
 data_in = root_dir / "data-in"
 data_out = root_dir / "data-out"
 
+# Value used for a whole surface when a day has too few usable quotes.
+FALLBACK_VOL = 0.25
+
 
 def calculate_implied_volatility(S, K, T, r, market_price, option_type="call"):
     """
-    Calculate implied volatility using LetsBeRational if available.
+    Calculate Black implied volatility with Let's Be Rational (pylbr).
+
+    Note: S is used as the forward and the price is treated as undiscounted,
+    so r is currently ignored.
     """
-    # ImpliedBlackVolatility(price, S, K, T, q)
-    # q = 1 for call, -1 for put
+    # Imported lazily: only surface generation needs it.
+    from pylbr import implied_volatility_from_a_transformed_rational_guess
+
+    # (price, F, K, T, q), q = 1 for call, -1 for put
     q = 1 if option_type == "call" else -1
 
     try:
-        iv = ImpliedBlackVolatility(market_price, S, K, T, q)
-        return iv
+        return implied_volatility_from_a_transformed_rational_guess(
+            market_price, S, K, T, q
+        )
     except Exception:
         return None
 
@@ -56,40 +71,35 @@ def prepare_daily_data(daily_df, underlying_price, r=0.02):
     tau_list = []
     iv_list = []
 
-    # Iterate over the dataframe rows to build the cloud of points
     for _, row in daily_df.iterrows():
         K = float(row["strike"])
         dte_days = float(row["dte"])
 
-        # Skip invalid DTE
         if dte_days <= 0:
             continue
 
         tau = dte_days / 365.0
         m = K / underlying_price  # Moneyness definition for VolGAN (Strike / Spot)
 
-        # IV Calculation
-        # Prefer pre-calculated if available/trusted, but instructions implied using tools.
-        # Let's check if 'c_iv' exists and is valid, otherwise calc.
+        # Prefer the vendor IV when present and sane, otherwise invert c_last.
         iv = None
         if "c_iv" in row and pd.notna(row["c_iv"]):
             try:
                 val = float(row["c_iv"])
                 if 0.0 < val < 5.0:
                     iv = val
-            except:
+            except (TypeError, ValueError):
                 pass
 
         if iv is None:
-            price = row["c_last"]
             try:
-                price = float(price)
-                if price > 0:
-                    iv = calculate_implied_volatility(
-                        underlying_price, K, tau, r, price, "call"
-                    )
-            except:
-                pass
+                price = float(row["c_last"])
+            except (TypeError, ValueError):
+                price = None
+            if price is not None and price > 0:
+                iv = calculate_implied_volatility(
+                    underlying_price, K, tau, r, price, "call"
+                )
 
         if iv is not None and 0.0 < iv < 5.0:
             m_list.append(m)
@@ -99,9 +109,12 @@ def prepare_daily_data(daily_df, underlying_price, r=0.02):
     return np.array(m_list), np.array(tau_list), np.array(iv_list)
 
 
-def generate_surface(input_price_file, input_vol_file, output_surface_file):
+def generate_surface(input_vol_file, output_surface_file, h1=0.01, h2=0.02):
     """
-    Orchestrator function: Load Options -> Generate Surface Grid -> Save
+    Load option quotes, smooth each day onto the (M_GRID, TAU_GRID) grid and
+    save one flattened surface per quote date.
+
+    Spot comes from the options file's underlying_last column.
     """
     print(f"Loading options data from {input_vol_file}...")
 
@@ -109,7 +122,6 @@ def generate_surface(input_price_file, input_vol_file, output_surface_file):
         print(f"Error: File {input_vol_file} not found.")
         return
 
-    # Read CSV
     try:
         df = pd.read_csv(input_vol_file)
     except Exception as e:
@@ -121,80 +133,64 @@ def generate_surface(input_price_file, input_vol_file, output_surface_file):
         c.replace("[", "").replace("]", "").strip().lower() for c in df.columns
     ]
 
-    # Ensure necessary columns exist
     required_cols = {"quote_date", "underlying_last", "dte", "strike", "c_last"}
     if not required_cols.issubset(df.columns):
         print(f"Error: Missing columns. Found: {df.columns}")
         print(f"Required: {required_cols}")
         return
 
-    # Convert date
     print("Processing dates...")
     df["date_dt"] = pd.to_datetime(df["quote_date"])
-
-    # Sort by date
     df = df.sort_values("date_dt")
 
     unique_dates = df["date_dt"].unique()
     print(f"Found {len(unique_dates)} unique dates.")
 
-    # Define Target Grid
-    # 10 moneyness points x 8 time points
-    lk = 10
-    lt = 8
-    m_grid = np.linspace(0.6, 1.4, lk)
-    tau_grid_days = np.array([30, 60, 91, 122, 152, 182, 273, 365])
-    tau_grid = tau_grid_days / 365.0
-
     surfaces_data = []
+    n_fallback = 0
+    n_nan_filled = 0
 
-    # Kernel bandwidths for smoothing
-    # These may need tuning.
-    # h1 (moneyness) ~ 0.05-0.1, h2 (time) ~ 0.1-0.2
-    h1 = 0.05
-    h2 = 0.1
+    # Kernel bandwidths h1 (moneyness) and h2 (maturity, years). datacleaning.kernel
+    # uses exp(-x^2 / (2 h)), as in the paper's eq. 21, so they are variances. The
+    # default (0.01, 0.02), i.e. standard deviations of 0.10 and 0.14 years, was chosen
+    # on 16 training-period days as the knee between leave-one-out fit error and the
+    # arbitrage penalty of the smoothed surface. The old (0.05, 0.1) had about 55% more
+    # LOO error; the paper's SPX choice (0.002, 0.046) had about 5x the arbitrage
+    # penalty on this data.
+    print(f"Kernel bandwidths h1={h1}, h2={h2}")
 
-    # Process each day
-    for date_val in tqdm(unique_dates, desc="Generating Surfaces"):
-        daily_df = df[df["date_dt"] == date_val]
-
-        if daily_df.empty:
-            continue
-
-        # Get underlying price
+    for date_val, daily_df in tqdm(df.groupby("date_dt"), desc="Generating Surfaces"):
         S = daily_df["underlying_last"].iloc[0]
 
-        # Prepare data for interpolation
         m_in, tau_in, iv_in = prepare_daily_data(daily_df, S)
 
         if len(iv_in) < 10:
-            # Let's output a warning and fill with mean or 0.25.
-            # print(f"Warning: Not enough data for {date_val}, using fallback.")
-            surface_flat = np.full(lk * lt, 0.25)
-            surfaces_data.append(surface_flat)
+            n_fallback += 1
+            surfaces_data.append(np.full(LK * LT, FALLBACK_VOL))
             continue
 
-        # Smooth / Interpolate
-        # Smooth returns matrix (len(m_want), len(tau_want)) -> (lk, lt)
-        surface_matrix = Smooth(iv_in, m_in, tau_in, m_grid, tau_grid, h1, h2)
+        # Smooth returns matrix (LK, LT)
+        surface_matrix = Smooth(iv_in, m_in, tau_in, M_GRID, TAU_GRID, h1, h2)
 
-        # Handle NaNs (extrapolation issues)
         if np.isnan(surface_matrix).any():
-            # Fill NaNs with nearest valid or mean
-            # Simple fill with mean of valid values
+            n_nan_filled += 1
             valid_mean = np.nanmean(surface_matrix)
             if np.isnan(valid_mean):
-                valid_mean = 0.25
+                valid_mean = FALLBACK_VOL
             surface_matrix = np.nan_to_num(surface_matrix, nan=float(valid_mean))
 
-        # Flatten using entangle_kt
-        surface_vector = entangle_kt(surface_matrix, lk, lt)
+        surfaces_data.append(entangle_kt(surface_matrix, LK, LT))
 
-        surfaces_data.append(surface_vector)
+    if n_fallback or n_nan_filled:
+        print(
+            f"Warning: {n_fallback} days used a flat {FALLBACK_VOL} fallback surface; "
+            f"{n_nan_filled} days had NaN grid points filled with the day's mean."
+        )
 
-    # Convert to DataFrame
     df_out = pd.DataFrame(
-        surfaces_data, index=unique_dates, columns=[f"vol_{i}" for i in range(lk * lt)]
+        surfaces_data,
+        index=pd.DatetimeIndex(unique_dates).strftime("%Y-%m-%d"),
+        columns=[f"vol_{i}" for i in range(LK * LT)],
     )
 
     print(f"Saving {len(df_out)} surfaces to {output_surface_file}...")
@@ -225,163 +221,95 @@ def analyze_inputs(datapath, surfacepath):
     plt.show()
 
 
-def train(datapath, surfacepath, device) -> VolGANResults:
-    tr = 0.85
-    noise_dim = 32
-    hidden_dim = 16
-    n_epochs = 10000
-    n_grad = 25
-
+def train(
+    datapath,
+    surfacepath,
+    device,
+    n_epochs=10000,
+    batch_size=100,
+    noise_dim=DEFAULT_NOISE_DIM,
+    hidden_dim=16,
+    n_grad=25,
+) -> VolGANResults:
     return VolGAN(
         datapath,
         surfacepath,
-        tr,
+        tr=0.85,
         noise_dim=noise_dim,
         hidden_dim=hidden_dim,
         n_epochs=n_epochs,
         n_grad=n_grad,
         lrg=0.0001,
         lrd=0.0001,
-        batch_size=100,
+        batch_size=batch_size,
         device=device,
     )
+
+
+def _to_device(x, device):
+    if isinstance(x, np.ndarray):
+        x = torch.tensor(x, dtype=torch.float32)
+    return x.to(device)
 
 
 def simulate(
     volgan_res: VolGANResults,
     device: str,
+    n_sims: int = 10000,
+    output_html: Path = Path("generated_surface.html"),
 ):
-
-    (
-        gen,
-        gen_opt,
-        disc,
-        disc_opt,
-        true_train,
-        true_val,
-        true_test,
-        condition_train,
-        condition_val,
-        condition_test,
-        dates_t,
-        m,
-        tau,
-        ms,
-        taus,
-    ) = volgan_res
-
-    # Move models to the correct device
-    gen.to(device)
-    disc.to(device)
+    gen = volgan_res.gen.to(device)
     gen.eval()
+    condition_test = _to_device(volgan_res.condition_test, device)
+    noise_dim = volgan_res.noise_dim
 
-    # Move tensors to the correct device
-    # First, ensure they are PyTorch tensors, then move to device
-    if isinstance(true_train, np.ndarray):
-        true_train = torch.tensor(true_train, dtype=torch.float32)
-    # if isinstance(true_val, np.ndarray):
-    #     true_val = torch.tensor(true_val, dtype=torch.float32)
-    if isinstance(true_test, np.ndarray):
-        true_test = torch.tensor(true_test, dtype=torch.float32)
-    if isinstance(condition_train, np.ndarray):
-        condition_train = torch.tensor(condition_train, dtype=torch.float32)
-    # if isinstance(condition_val, np.ndarray):
-    #     condition_val = torch.tensor(condition_val, dtype=torch.float32)
-    if isinstance(condition_test, np.ndarray):
-        condition_test = torch.tensor(condition_test, dtype=torch.float32)
+    n_test = condition_test.shape[0]
+    dtm = volgan_res.tau * 365
 
-    true_train = true_train.to(device)
-    # true_val = true_val.to(device)
-    true_test = true_test.to(device)
-    condition_train = condition_train.to(device)
-    # condition_val = condition_val.to(device)
-    condition_test = condition_test.to(device)
+    # Penalty matrices and grids, built once and broadcast over the test set
+    mP_t, mP_k, mPb_K = penalty_mutau_tensor(volgan_res.m, dtm, device)
+    m_t = torch.tensor(volgan_res.ms, dtype=torch.float, device=device)
+    t_t = torch.tensor(volgan_res.taus, dtype=torch.float, device=device)
+    Pts_test = mP_t.unsqueeze(0).repeat((n_test, 1, 1))
+    Pks_test = mP_k.unsqueeze(0).repeat((n_test, 1, 1))
+    Pkbs_test = mPb_K.unsqueeze(0).repeat((n_test, 1, 1))
+    ms_test = m_t.unsqueeze(0).repeat((n_test, 1, 1))
+    ts_test = t_t.unsqueeze(0).repeat((n_test, 1, 1))
 
-    noise_dim = 32
+    surface_past_test = condition_test[:, 3:]
+    tots_test = np.zeros((n_test, n_sims))
+    first_surface = None
 
-    ntr = true_train.shape[0]
-    B = 10000
-    dtm = tau * 365
-    # calculate the panlaty matrices
-    mP_t, mP_k, mPb_K = penalty_mutau_tensor(m, dtm, device)
-    m_t = torch.tensor(ms, dtype=torch.float, device=device)
-    t_t = torch.tensor(taus, dtype=torch.float, device=device)
-    n_test = true_test.shape[0]
-    tots_test = np.zeros((n_test, B))
-    Pks_t_test = mP_k.unsqueeze(0).repeat((n_test, 1, 1))
-    Pkbs_t_test = mPb_K.unsqueeze(0).repeat((n_test, 1, 1))
-    Ks_t_test = m_t.unsqueeze(0).repeat((n_test, 1, 1))
-    ts_t_test = t_t.unsqueeze(0).repeat((n_test, 1, 1))
-    ms_t_test = m_t.unsqueeze(0).repeat((n_test, 1, 1))
-    fk = torch.empty(size=(B, n_test, 10, 8), device=device)
-    fk_ent = np.zeros((B, n_test, 80))
-    fk_inc = np.zeros((B, n_test, 80))
-    ret_u = np.zeros((B, n_test))
-    # tots
-    tots_test = np.zeros((n_test, B))
     with torch.no_grad():
-        for l in tqdm(range(B)):
-            # sample noise
+        for l in tqdm(range(n_sims)):
             noise = torch.randn((n_test, noise_dim), device=device, dtype=torch.float)
-            # sample from the generator
-            fake = gen(noise, condition_test[:, :])
-            surface_past_test = condition_test[:, 3:]
-            # simulated implied vol surfaces as vectors
+            fake = gen(noise, condition_test)
+            # simulated implied vol surfaces as flattened vectors
             fake_surface = torch.exp(fake[:, 1:] + surface_past_test)
-            # simulated surfaces as a matrices
-            fk_ent[l, :, :] = fake_surface.cpu().detach().numpy()
-            # simulated increments
-            fk_inc[l, :, :] = fake[:, 1:].cpu().detach().numpy()
-            ret_u[l, :] = fake[:, 0].cpu().detach().numpy()
-            for i in range(8):
-                fk[l, :, :, i] = fake_surface[:, (i * 10) : ((i + 1) * 10)]
-            # calculating arbitrage penalties
-            Pks_t_test = mP_k.unsqueeze(0).repeat((n_test, 1, 1))
-            Pkbs_t_test = mPb_K.unsqueeze(0).repeat((n_test, 1, 1))
-            BS = smallBS_tensor(
-                ms_t_test[:, :, :], ts_t_test[:, :, :], fk[l, :, :, :], 0, device=device
-            )
+            if first_surface is None:
+                first_surface = fake_surface[0].cpu().numpy()
 
-            _, _, _, tot = arbitrage_penalty_tensor(
-                BS,
-                mP_t.unsqueeze(0).repeat((n_test, 1, 1)),
-                Pks_t_test[:, :, :],
-                Pkbs_t_test[:, :, :],
-            )
-            tots_test[:, l] = tot.cpu().detach().numpy()
+            # (n_test, LK * LT) time-major -> (n_test, LK, LT)
+            fk = fake_surface.reshape(n_test, LT, LK).transpose(1, 2)
 
-    # Check arbitrage penalties
+            BS = smallBS_tensor(ms_test, ts_test, fk, 0, device=device)
+            _, _, _, tot = arbitrage_penalty_tensor(BS, Pts_test, Pks_test, Pkbs_test)
+            tots_test[:, l] = tot.cpu().numpy()
+
+    mean_per_day = np.mean(tots_test, axis=1)
     print(
-        "Sim ",
+        "Arbitrage penalty  mean:",
         np.mean(tots_test),
-        np.std(np.mean(tots_test, axis=1)),
-        np.median(np.mean(tots_test, axis=1)),
+        " std(day means):",
+        np.std(mean_per_day),
+        " median(day means):",
+        np.median(mean_per_day),
     )
 
-    # Plot one generated surface
     print("Generating interactive 3D surface plot...")
+    surf_matrix = detangle_kt(first_surface, LK, LT)
 
-    # Pick the first test sample and first batch generation
-    sample_idx = 0
-    batch_idx = 0
-    surf_vec = fk_ent[batch_idx, sample_idx, :]
-
-    lk = 10
-    lt = 8
-
-    surf_matrix = detangle_kt(surf_vec, lk, lt)
-
-    m_grid = np.linspace(0.6, 1.4, lk)
-    tau_grid_days = np.array([30, 60, 91, 122, 152, 182, 273, 365])
-    tau_grid = tau_grid_days / 365.0
-
-    # Create plotly figure
-    # z axis: Implied Volatility
-    # x axis: Time to Maturity
-    # y axis: Moneyness
-    # surf_matrix is (10, 8) -> 10 rows (moneyness), 8 cols (time).
-    fig = go.Figure(data=[go.Surface(z=surf_matrix, x=tau_grid, y=m_grid)])
-
+    fig = go.Figure(data=[go.Surface(z=surf_matrix, x=TAU_GRID, y=M_GRID)])
     fig.update_layout(
         title="Generated Volatility Surface (Sample 0)",
         scene=dict(
@@ -392,7 +320,6 @@ def simulate(
         autosize=True,
     )
 
-    output_html = "generated_surface.html"
     fig.write_html(output_html)
     print(f"3D interactive surface plot saved to {output_html}")
 
@@ -402,24 +329,16 @@ if __name__ == "__main__":
 
     # actions
     parser.add_argument(
-        "--analyze",
-        action="store_true",
-        help="Flag to indicate whether to analyze the inputs",
+        "--analyze", action="store_true", help="Plot realised vol of the inputs"
     )
+    parser.add_argument("--train", action="store_true", help="Train the model")
     parser.add_argument(
-        "--train",
-        action="store_true",
-        help="Flag to indicate whether to train the model",
-    )
-    parser.add_argument(
-        "--simulate",
-        action="store_true",
-        help="Flag to indicate whether to simulate the model",
+        "--simulate", action="store_true", help="Simulate from a trained model"
     )
     parser.add_argument(
         "--generate-surface",
         action="store_true",
-        help="Flag to indicate whether to generate the surface",
+        help="Build the surface CSV from raw option quotes",
     )
 
     # paths
@@ -433,7 +352,7 @@ if __name__ == "__main__":
         "--raw-vol-data-path",
         type=Path,
         default=data_in / "aapl_2016_2020.csv",
-        help="Path to the implied vol data CSV file",
+        help="Path to the raw option quotes CSV file",
     )
     parser.add_argument(
         "--surface-path",
@@ -445,10 +364,28 @@ if __name__ == "__main__":
         "--output-path",
         type=Path,
         default=data_out / "volgan_res.pkl",
-        help="Path to save the VolGAN results pickle file",
+        help="Path to save/load the VolGAN results pickle file",
+    )
+    parser.add_argument(
+        "--h1",
+        type=float,
+        default=0.01,
+        help="--generate-surface kernel variance in moneyness",
+    )
+    parser.add_argument(
+        "--h2",
+        type=float,
+        default=0.02,
+        help="--generate-surface kernel variance in maturity (years)",
+    )
+    parser.add_argument(
+        "--html-path",
+        type=Path,
+        default=Path("generated_surface.html"),
+        help="Where --simulate writes the 3D surface plot",
     )
 
-    # training parameters
+    # training / simulation parameters
     parser.add_argument(
         "--epochs", type=int, default=10000, help="Number of training epochs"
     )
@@ -456,28 +393,59 @@ if __name__ == "__main__":
         "--batch-size", type=int, default=100, help="Batch size for training"
     )
     parser.add_argument(
-        "--device", type=str, default="cuda", help="Device to use for training"
+        "--noise-dim",
+        type=int,
+        default=DEFAULT_NOISE_DIM,
+        help="Generator noise dimension",
+    )
+    parser.add_argument(
+        "--n-grad",
+        type=int,
+        default=25,
+        help="Gradient-matching epochs used to set penalty weights",
+    )
+    parser.add_argument(
+        "--n-sims",
+        type=int,
+        default=10000,
+        help="Number of simulations per test day for --simulate",
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda", help="Device to use (cuda/cpu)"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed torch/numpy RNGs. Runs are repeatable on the same device and "
+        "library versions; GPU results may still differ slightly between runs.",
     )
 
     args = parser.parse_args()
 
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)  # also seeds all CUDA devices
+
     res = None
 
     if args.generate_surface:
-        input_file_vol_surface = args.raw_vol_data_path
-
-        # Ensure output directory exists
         Path(args.surface_path).parent.mkdir(parents=True, exist_ok=True)
-
-        generate_surface(
-            args.price_data_path, input_file_vol_surface, args.surface_path
-        )
+        generate_surface(args.raw_vol_data_path, args.surface_path, args.h1, args.h2)
 
     if args.analyze:
         analyze_inputs(args.price_data_path, args.surface_path)
 
     if args.train:
-        res = train(args.price_data_path, args.surface_path, args.device)
+        res = train(
+            args.price_data_path,
+            args.surface_path,
+            args.device,
+            n_epochs=args.epochs,
+            batch_size=args.batch_size,
+            noise_dim=args.noise_dim,
+            n_grad=args.n_grad,
+        )
 
         dated_output_path = args.output_path.with_name(
             f"{args.output_path.stem}_{datetime.now():%Y%m%d_%H%M%S}.pkl"
@@ -491,7 +459,6 @@ if __name__ == "__main__":
 
     if args.simulate:
         if res is None:
-            with args.output_path.open("rb") as fh:
-                res = pickle.load(fh)
+            res = load_results(args.output_path, map_location=args.device)
 
-        simulate(res, args.device)
+        simulate(res, args.device, n_sims=args.n_sims, output_html=args.html_path)

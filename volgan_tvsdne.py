@@ -1,5 +1,5 @@
 import argparse
-import pickle
+import html
 from pathlib import Path
 
 import numpy as np
@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import torch
 from aiohttp import web
 
-from VolGAN import detangle_kt
+from VolGAN import LK, LT, M_GRID, TAU_GRID, detangle_kt, load_results
 
 root_dir = Path(__file__).parent
 data_out = root_dir / "data-out"
@@ -23,30 +23,13 @@ def load_model(pkl_path: Path, device_name: str):
     DEVICE = device_name
 
     try:
-        with pkl_path.open("rb") as fh:
-            MODEL_RES_RAW = pickle.load(fh)
+        MODEL_RES_RAW = load_results(pkl_path, map_location=DEVICE)
     except FileNotFoundError:
         print(f"Error: Could not find model file at {pkl_path}")
         raise
 
-    # Unpack for setup
-    (
-        gen,
-        gen_opt,
-        disc,
-        disc_opt,
-        true_train,
-        true_val,
-        true_test,
-        condition_train,
-        condition_val,
-        condition_test,
-        dates_t,
-        m,
-        tau,
-        ms,
-        taus,
-    ) = MODEL_RES_RAW
+    gen = MODEL_RES_RAW.gen
+    condition_test = MODEL_RES_RAW.condition_test
 
     # Move to device
     print(f"Moving model to {DEVICE}...")
@@ -62,6 +45,7 @@ def load_model(pkl_path: Path, device_name: str):
     MODEL_RES = {
         "gen": gen,
         "condition_test": condition_test,
+        "noise_dim": MODEL_RES_RAW.noise_dim,
     }
     print("Model loaded successfully.")
 
@@ -81,7 +65,7 @@ def generate_surface_plot():
     # log_iv_tm1 starts at index 3
     surface_past = cond[:, 3:]
 
-    noise_dim = 32  # Hardcoded in VolGAN architecture usually
+    noise_dim = MODEL_RES["noise_dim"]
     noise = torch.randn((1, noise_dim), device=DEVICE, dtype=torch.float)
 
     with torch.no_grad():
@@ -93,17 +77,10 @@ def generate_surface_plot():
 
     # Detangle 1D vector back to 2D matrix
     vec = fake_surface.cpu().numpy().flatten()
-    lk = 10
-    lt = 8
-    surf_matrix = detangle_kt(vec, lk, lt)
-
-    # Grid definition (Hardcoded matching VolGAN-cli logic)
-    m_grid = np.linspace(0.6, 1.4, lk)
-    tau_grid_days = np.array([30, 60, 91, 122, 152, 182, 273, 365])
-    tau_grid = tau_grid_days / 365.0
+    surf_matrix = detangle_kt(vec, LK, LT)
 
     # Create Plotly figure
-    fig = go.Figure(data=[go.Surface(z=surf_matrix, x=tau_grid, y=m_grid)])
+    fig = go.Figure(data=[go.Surface(z=surf_matrix, x=TAU_GRID, y=M_GRID)])
     fig.update_layout(
         title=f"Generated Volatility Surface (Sample Index: {idx})",
         scene=dict(
@@ -164,7 +141,7 @@ async def handle(request):
                     <button type="submit">Refresh Vol Surface</button>
                 </form>
                 <div class="footer">
-                    Trained on APPL options data 2016-2020 obtained from Kaggle datasets. 
+                    Trained on AAPL options data 2016-2020 obtained from Kaggle datasets. 
                 </div>
             </div>
         </body>
@@ -173,7 +150,7 @@ async def handle(request):
         return web.Response(text=html, content_type="text/html")
     except Exception as e:
         return web.Response(
-            text=f"<h1>Error generating surface</h1><pre>{str(e)}</pre>",
+            text=f"<h1>Error generating surface</h1><pre>{html.escape(str(e))}</pre>",
             content_type="text/html",
             status=500,
         )
